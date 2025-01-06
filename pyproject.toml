@@ -1,0 +1,28 @@
+[build-system]
+  requires = ["setuptools>=61.0", "wheel"]
+  build-backend = "setuptools.build_meta"
+
+[project]
+  name = "gamerl.dqn.jax"
+  version = "0.1.1"
+  description = "JAX implementation of Deep Q-Network"
+  readme = "README.md"
+  requires-python = ">=3.7"
+  license = {text = "MIT"}
+  authors = [{name = "pi-tau", email = "pi.tau@yahoo.com"}]
+  dependencies = [
+    "jax",
+    "numpy",
+    "tqdm"
+  ]
+  classifiers=[
+    'Programming Language :: Python :: 3',
+    'License :: OSI Approved :: MIT License',
+    'Operating System :: OS Independent'
+  ]
+
+[project.urls]
+  Source = "https://github.com/game-rl/dqn"
+
+[tool.setuptools.packages.find]
+  include = ["gamerl.dqn.jax"]
