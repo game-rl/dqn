@@ -237,16 +237,22 @@ def td_loss(
     obs, acts, rewards, obs_next, done = batch
     B = obs.shape[0]
 
-    # Compute the q-values for the current obs and the next obs.
+    # Compute the q-values for the current obs.
     q_values = q_fn(params, obs)            # shape (B, acts)
     q_preds = q_values[jnp.arange(B), acts] # shape (B,)
+
+    # Compute the q-values for the next obs using double q-learning.
+    # Select the maximizing actions using the online network, but compute
+    # the q-values using the target network.
+    acts_next = jnp.argmax(q_fn(params, obs_next), axis=1)
     q_next = q_fn(tgt_params, obs_next)     # shape (B, acts)
+    q_next = q_next[jnp.arange(B), acts_next]
     q_next = jax.lax.stop_gradient(q_next)
 
     # Calculate the Huber loss.
     # 0.5 * err^2                   if |err| <= d
     # 0.5 * d^2 + d * (|err| - d)   if |err| > d
-    errs = rewards + discount * jnp.max(q_next, axis=1) * ~done - q_preds
+    errs = rewards + discount * q_next * ~done - q_preds
     abs_errs = jnp.abs(errs)
     quadratic = jnp.minimum(abs_errs, delta)
     # Same as max(abs_errs - delta, 0) but avoids potentially doubling gradient.
