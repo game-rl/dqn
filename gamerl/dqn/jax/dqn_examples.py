@@ -1,9 +1,10 @@
 import os
+import warnings
 
 import gymnasium as gym
 import jax
 import jax.numpy as jnp
-from jax.nn.initializers import uniform, kaiming_uniform, zeros, glorot_normal
+from jax.nn.initializers import uniform, zeros, glorot_normal
 import jax.example_libraries.stax as stax
 import jax.example_libraries.optimizers as optim
 import numpy as np
@@ -11,6 +12,8 @@ import matplotlib.pyplot as plt
 
 from dqn import DQNTrainer
 from replay_buffers import VanillaReplayBuffer
+
+gym.logger.min_level = gym.logger.ERROR
 
 
 # EnvironmentStepFn is a Callable that steps the environment.
@@ -44,14 +47,13 @@ class OptimizerFn:
         self.step += 1
         return params, opt_state
 
-
 # CartPole trains a DQN Agent on the CartPole-v1 gym environment.
 def CartPole():
     np.random.seed(seed=42)
     rng = jax.random.PRNGKey(seed=42)
 
     # Define the EnvironmentStepFn.
-    n_envs = 8
+    n_envs = 128
     steps_limit = 500
     env = gym.wrappers.vector.RecordEpisodeStatistics(
         gym.vector.SyncVectorEnv([
@@ -82,22 +84,18 @@ def CartPole():
     buffer = VanillaReplayBuffer(capacity=50000, obs_shape=in_shape)
 
     # Define the DQN Trainer.
-    n_steps, n_updates = 32, 128
     dqn_trainer = DQNTrainer(
         q_fn, optim_fn, env_fn, buffer,
-        n_steps=n_steps, discount=0.99, n_updates=n_updates, update_tgt=20, batch_size=64,
-        huber_delta=1.,
+        discount=0.99, batch_size=128, update_freq=1024, n_updates=512,
+        eps=lambda i: 1. if i < 1e4 else (2e5-i)/2e5 * 0.25,
     )
 
     log_dir = os.path.join("logs", "CartPole-v1")
     os.makedirs(log_dir, exist_ok=True)
 
     # Run the trainer and plot the results.
-    # The total number of time steps is ``n_iters x n_steps x n_envs``.
-    #                              1e5 =    400   x    32   x   8
-    n_iters = 1000
-    params, _ = dqn_trainer(rng, params, opt_state, n_iters=n_iters)
-    generate_plots(log_dir, dqn_trainer.train_log, n_steps, n_updates)
+    params, _ = dqn_trainer(rng, params, opt_state, n_steps=int(2e5), prefill_steps=int(5e4))
+    generate_plots(log_dir, dqn_trainer.train_log)
     record_demo(rng, log_dir, "CartPole-v1", q_fn, params)
     env.close()
 
@@ -107,7 +105,7 @@ def LunarLander():
     rng = jax.random.PRNGKey(seed=0)
 
     # Define the EnvironmentStepFn.
-    n_envs = 16
+    n_envs = 128
     steps_limit = 500
     env = gym.wrappers.vector.RecordEpisodeStatistics(
         gym.vector.SyncVectorEnv([
@@ -147,25 +145,20 @@ def LunarLander():
     buffer = VanillaReplayBuffer(capacity=50000, obs_shape=in_shape)
 
     # Define the DQN Trainer.
-    n_steps, n_updates = 32, 128
     dqn_trainer = DQNTrainer(
         q_fn, optim_fn, env_fn, buffer,
-        n_steps=n_steps, discount=0.99, n_updates=n_updates, update_tgt=10, batch_size=64,
-        huber_delta=1.,
+        discount=0.99, batch_size=128, update_freq=4096, n_updates=512,
+        eps=lambda i: 1. if i < 1e4 else (2e6-i)/2e6 * 0.12 + 0.04 if i < 2e6 else 0.04,
     )
 
     log_dir = os.path.join("logs", "LunarLander-v3")
     os.makedirs(log_dir, exist_ok=True)
 
     # Run the trainer and plot the results.
-    # The total number of time steps is ``n_iters x n_steps x n_envs``.
-    #                             2.5e6 =  5000   x    32   x   16
-    n_iters = 5000 # 2000 is fine
-    params, _ = dqn_trainer(rng, params, opt_state, n_iters=n_iters)
-    generate_plots(log_dir, dqn_trainer.train_log, n_steps, n_updates)
+    params, _ = dqn_trainer(rng, params, opt_state, n_steps=int(3e6), prefill_steps=int(5e4))
+    generate_plots(log_dir, dqn_trainer.train_log)
     record_demo(rng, log_dir, "LunarLander-v3", q_fn, params)
     env.close()
-
 
 def record_demo(rng, log_dir, env_name, q_fn, params):
     env = gym.wrappers.RecordVideo(
@@ -185,51 +178,58 @@ def record_demo(rng, log_dir, env_name, q_fn, params):
         o, r, t, tr, info = env.step(acts)
     env.close()
 
-def generate_plots(log_dir, train_log, n_steps, n_updates):
+def generate_plots(log_dir, train_log):
     plt.style.use("ggplot")
 
-    keys = ("Total Loss", "Total Grad Norm")
-    for k in keys:
-        assert isinstance(train_log[k][0], float), "non-numerical log"
-        assert len(train_log[k]) % n_updates == 0, "total not divisible"
-        total = len(train_log[k])
-        xs = np.linspace(0, total-n_updates, total//n_updates)
-        ys = np.array(train_log[k]).reshape(-1, n_updates)
-        avg, std = ys.mean(axis=1), ys.std(axis=1)
+    total_steps = train_log["hyperparams"][0]["n_steps"]
+    n_updates = train_log["hyperparams"][0]["n_updates"]
+
+    for k in train_log.keys():
+        if k == "hyperparams": continue # skip this
+
         fig, ax = plt.subplots()
-        ax.plot(xs, avg, label=k)
-        ax.fill_between(xs, avg-0.5*std, avg+0.5*std, color="k", alpha=0.25)
 
-        xs_ = np.linspace(0, total-n_updates, total//n_updates//20)
-        ys_ = np.array(train_log[k]).reshape(-1, 20*n_updates)
-        ax.plot(xs_, np.nanmean(ys_, axis=1))
+        # When plotting episode lengths and returns use number of
+        # steps on the x-axis. Otherwise use number of updates.
+        n_iters = len(train_log[k])
+        total_updates = n_iters * n_updates
+        xs_s = np.linspace(0, total_steps, n_iters)
+        xs_u = np.linspace(0, total_updates, n_iters)
+        xs = xs_s if k in {"ep_r", "ep_l"} else xs_u
+        x_label = "Total time-steps" if k in {"ep_r", "ep_l"} else "Gradient updates"
 
-        ax.set_xlabel("Gradient updates")
+        # Unpack the avg and the std from the train log.
+        avg, std = zip(*train_log[k])
+        avg, std = np.array(avg), np.array(std)
+
+        # Remove NaNs, if any.
+        xs_ = xs[~(avg != avg)]
+        avg_ = avg[~(avg != avg)]
+        std_ = std[~(std != std)]
+
+        # Plot the avg and the std.
+        ax.plot(xs_, avg_, label="Average")
+        ax.fill_between(xs_, avg_-0.5*std_, avg_+0.5*std_, color="k", alpha=0.25)
+
+        # Plot a smother curve averaged over `avg_every` entries.
+        avg_every = 20
+        xs2 = xs[::avg_every]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            # xs has `ceil(n_items / avg_every)` elems. We need to pad the ys.
+            ys = np.nanmean(np.pad(
+                avg,
+                (0, -len(avg)%avg_every),
+                constant_values=np.nan,
+            ).reshape(-1, avg_every), axis=1)
+        xs2 = xs2[~(ys != ys)]          # Remove NaNs, if any.
+        ys = ys[~(ys != ys)]
+        ax.plot(xs2, ys, label="Running", linewidth=3)
+
+        ax.legend()
+        ax.set_xlabel(x_label)
         ax.set_ylabel(k)
         ax.ticklabel_format(style="sci", axis="x", scilimits=(0,0))
-        ax.legend()
-        fig.savefig(os.path.join(log_dir, k.replace(" ", "_")+".png"))
-
-    keys = ("Episode Returns", "Episode Lengths")
-    for k in keys:
-        assert isinstance(train_log[k][0], float), "non-numerical log"
-        assert len(train_log[k]) % n_steps == 0, "total not divisible"
-        total = len(train_log[k])
-        xs = np.linspace(0, total-n_steps, total//n_steps)
-        ys = np.array(train_log[k]).reshape(-1, n_steps)
-        avg, std = np.nanmean(ys, axis=1), np.nanstd(ys, axis=1)
-        fig, ax = plt.subplots()
-        ax.plot(xs, avg, label=k)
-        ax.fill_between(xs, avg-0.5*std, avg+0.5*std, color="k", alpha=0.25)
-
-        xs_ = np.linspace(0, total-n_steps, total//n_steps//20)
-        ys_ = np.array(train_log[k]).reshape(-1, 20*n_steps)
-        ax.plot(xs_, np.nanmean(ys_, axis=1))
-
-        ax.set_xlabel("Number of steps")
-        ax.set_ylabel(k)
-        ax.ticklabel_format(style="sci", axis="x", scilimits=(0,0))
-        ax.legend()
         fig.savefig(os.path.join(log_dir, k.replace(" ", "_")+".png"))
 
 if __name__ == "__main__":

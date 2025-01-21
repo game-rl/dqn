@@ -4,12 +4,11 @@ import jax
 from jax.typing import ArrayLike
 import numpy as np
 
-
-# Key for a pseudo random number generator (PRNG).
 Key = Any
+"""Key for a pseudo random number generator (PRNG)."""
 
-# Transitions is a tuple (o, a, r, o_next, d) of nd-arrays.
 Transitions = tuple[ArrayLike, ArrayLike, ArrayLike, ArrayLike, ArrayLike]
+"""Tuple (o, a, r, o_next, d) of nd-arrays."""
 
 class VanillaReplayBuffer:
 
@@ -72,8 +71,5 @@ class VanillaReplayBuffer:
             self.rewards[idxs],
             self.obs_next[idxs],
             self.done[idxs])
-
-    def __len__(self) -> int:
-        return self.size
 
 #
