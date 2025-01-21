@@ -57,6 +57,7 @@ EnvironmentStepFn = Callable[
 #   - the next observations ``o_next``;
 #   - boolean flags ``d`` indicating which ``o_next`` are terminal.
 Transitions = tuple[ArrayLike, ArrayLike, ArrayLike, ArrayLike, ArrayLike]
+"""Tuple (o, a, r, o_next, d) of nd-arrays."""
 
 # ReplayBuffer is a container for storing and sampling transitions.
 # Implementations might include strategies for prioritized sampling of
@@ -68,51 +69,48 @@ class ReplayBuffer(Protocol):
     def sample(self, rng: Key, batch_size: int) -> Transitions:
         """Sample a batch of transitions from the buffer."""
 
-    def __len__(self) -> int:
-        """Return the number of transitions currently stored in the buffer."""
-
 # DQNTrainer is a callable that trains an agent to maximize
 # expected return from a given environment.
 @dataclass
 class DQNTrainer:
-    """DQNTrainer trains a Q-network for multiple iterations.
+    """DQNTrainer trains a Q-network over multiple time-steps.
 
-	Each training iteration consists of two stages:
-	  1. Data collection stage. The environment is stepped (possibly
-        multiple times) and the transitions are stored in a replay buffer;
-	  2. Parameter optimization stage. The parameters of the q-network
-        are optimized using a one-step TD target.
+    At each time-step the environment is stepped and the transitions
+    are stored in the replay buffer. Once the agent has performed a
+    fixed amount of steps, the parameters of the q-network are updated
+    by drawing random batches from the buffer and optimizing using a
+    one-step TD target.
 
-	The q-network and the environment are provided to the trainer upon
-	initialization. The trainer can then be called multiple times to
-	update the network parameters. You can see how well the current
+    The q-network and the environment are provided to the trainer upon
+    initialization. The trainer can then be called multiple times to
+    update the network parameters. You can see how well the current
     q-network is performing in between calling the trainer:
 
-	```python
-	# Initialize the trainer.
-	dqn_trainer = DQNTrainer(q_fn, optim_fn, env_fn, **kwargs)
+    ```python
+    # Initialize the trainer.
+    dqn_trainer = DQNTrainer(q_fn, optim_fn, env_fn, **kwargs)
 
-	# Call the trainer to update the current params.
-	params, opt_state = dqn_trainer(rng1, params, opt_state, n_iters)
+    # Call the trainer to update the current params.
+    params, opt_state = dqn_trainer(rng1, params, opt_state, n_steps, prefill_steps)
 
-	# Test the agent after training.
-	record_demo(env_fn, q_fn, params)
+    # Test the agent after training.
+    record_demo(env_fn, q_fn, params)
 
-	# Train the agent some more.
-	params, opt_state = dqn_trainer(rng2, params, opt_state, n_iters)
-	```
-	"""
+    # Train the agent some more.
+    params, opt_state = dqn_trainer(rng2, params, opt_state, n_steps, 0)
+    ```
+    """
 
     q_fn: DeepQNetwork
     optim_fn: OptimizerFn
     env_fn: EnvironmentStepFn
     replay_buffer: ReplayBuffer
     discount: float = 1.    # discount for future rewards
-    n_steps: int = 1        # number of steps before updating
-    n_updates: int = 1      # number of updates
-    update_tgt: int = 1     # how often to update the target net
+    update_freq: int = 1    # how often to update the q-network
+    n_updates: int = 1      # number of updates per iteration
     batch_size: int = 64    # batch size for iterating over the replay buffer
     huber_delta: float = 1. # bound for the huber loss transform
+    p: float = 0.99         # factor for Polyak averaging
     eps: Callable[[int], float] = lambda x: 0.05 # schedule for epsi-greedy
     train_log: dict[str, list[float]] = field( # for logging info during training
         default_factory=lambda: defaultdict(list), init=False)
@@ -122,7 +120,8 @@ class DQNTrainer:
         rng: Key,
         params: PyTree,
         opt_state: OptState,
-        n_iters: int
+        n_steps: int,
+        prefill_steps: int,
     ) -> tuple[PyTree, OptState]:
         """Update the q-network parameters using one-step TD learning.
 
@@ -133,7 +132,10 @@ class DQNTrainer:
                 Current parameters for the q-network.
             opt_state: OptState
                 Current optimizer state for the optimizer function.
-            n_iters: int
+            n_steps: int
+                Total number of time-steps to be performed.
+            prefill_steps: int
+                Number of time-steps to perform for pre-filling the buffer.
 
         Returns:
             PyTree
@@ -141,54 +143,79 @@ class DQNTrainer:
             OptState
                 The latest state of the optimizer.
         """
-        # Prefill the replay buffer.
-        while len(self.replay_buffer) < max(5*self.batch_size*self.n_updates, 1000):
-            # Step the environment and store the transition.
-            rng, rng_ = jax.random.split(rng, num=2)
-            ts, info = step(rng_, self.env_fn, self.q_fn, params, eps=1.)
-            self.replay_buffer.store(ts)
 
-        # Run the training procedure.
-        for i in tqdm(range(n_iters)):
-            # Maybe update the parameters of the target q-network.
-            if i % self.update_tgt == 0:
-                tgt_params = deepcopy(params)
+        n_envs = self.env_fn(None)[0].shape[0]
+        self.train_log["hyperparams"].append({
+            "n_steps": n_steps,
+            "n_envs": n_envs,
+            "n_updates": self.n_updates,
+        })
 
-            # Step the environment and store the transitions.
-            eps = self.eps(i)
-            for _ in range(self.n_steps):
+        tgt_params = deepcopy(params)   # tgt network params for double q-learning
+        ep_r, ep_l = [], []             # lists for storing episode stats
+        pbar = tqdm(total=n_steps)      # manual progress bar
+        steps = 0                       # total number of steps performed
+
+        while steps < n_steps:
+            s = 0               # inner loop steps counter
+            ep_r, ep_l = [], [] # lists for storing episode stats
+
+            # Continue stepping the environment until it is time for update.
+            while s < self.update_freq:
+                # Step the environment and store the transitions.
                 rng, rng_ = jax.random.split(rng, num=2)
-                ts, info = step(rng_, self.env_fn, self.q_fn, params, eps)
+                ts, info = step(rng_, self.env_fn, self.q_fn, params, eps=self.eps(steps+s))
                 self.replay_buffer.store(ts)
 
+                # Stepping the environment once actually performs `n_envs` steps.
+                s += n_envs
+                pbar.update(n_envs)
+
                 # Bookkeeping.
-                with warnings.catch_warnings():
-                    # We might make a step without completing any episodes. In
-                    # this case we want to store NaN in the history. Taking the
-                    # mean of an empty slice throws a runtime warning and returns
-                    # a NaN, which is exactly what we want.
-                    warnings.simplefilter("ignore", category=RuntimeWarning)
-                    self.train_log["Episode Returns"].append(np.mean(info["ep_r"]))
-                    self.train_log["Episode Lengths"].append(np.mean(info["ep_l"]))
+                ep_r.extend(info["ep_r"])
+                ep_l.extend(info["ep_l"])
+
+            steps += s              # update the total step counter
+            losses, norms = [], []  # lists for storing training stats
+
+            if steps < prefill_steps: continue
 
             # Update the parameters of the q-network.
-            rng, rng_ = jax.random.split(rng, num=2)
             for _ in range(self.n_updates):
-                # Sample transitions from the replay buffer.
                 rng, rng_ = jax.random.split(rng, num=2)
-                batch = self.replay_buffer.sample(rng_, self.batch_size)
+                ts = self.replay_buffer.sample(rng_, self.batch_size)
 
-                # Compute the loss and perform the backward pass.
+                # Compute the loss.
                 loss, grads = td_error(
-                    batch, self.q_fn, params, tgt_params, self.discount, self.huber_delta,
+                    ts, self.q_fn, params, tgt_params, self.discount, self.huber_delta,
                 )
-                params, opt_state = self.optim_fn(params, grads, opt_state)
 
                 # Bookkeeping.
                 leaves, _ = jax.tree.flatten(grads)
                 grad_norm = jnp.sqrt(sum(jnp.vdot(x, x) for x in leaves))
-                self.train_log["Total Grad Norm"].append(grad_norm.item())
-                self.train_log["Total Loss"].append(loss.item())
+                losses.append(loss.item())
+                norms.append(grad_norm.item())
+
+                # Backward pass. Update the parameters of the q-network.
+                params, opt_state = self.optim_fn(params, grads, opt_state)
+
+                # Update the target network parameters using Polyak averaging.
+                tgt_params = jax.tree.map(
+                    lambda x, y: self.p*x+(1-self.p)*y, tgt_params, params,
+                )
+
+            # Bookkeeping. Store training stats averaged over the number of
+            # updates. Store episode stats averaged over the time-steps.
+            self.train_log["loss"].append((np.mean(losses), np.std(losses)))
+            self.train_log["grad_norm"].append((np.mean(norms), np.std(norms)))
+            with warnings.catch_warnings():
+                # We might have not completed any episodes this iteration.
+                # Just store NaNs and ignore the warning.
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                self.train_log["ep_r"].append((np.mean(ep_r), np.std(ep_r)))
+                self.train_log["ep_l"].append((np.mean(ep_l), np.std(ep_l)))
+
+        pbar.close()
 
         return params, opt_state
 
@@ -257,7 +284,7 @@ def step(
 @partial(jax.jit, static_argnames="q_fn")
 @partial(jax.value_and_grad, argnums=2, has_aux=False)
 def td_error(
-    batch: Transitions,
+    ts: Transitions,
     q_fn: DeepQNetwork,
     params: PyTree,
     tgt_params: PyTree,
@@ -270,7 +297,7 @@ def td_error(
     ``loss = 0.5 * err**2 if err < delta else |err|``
 
     Args:
-        batch: Transitions
+        ts: Transitions
             Tuple (o, a, r, o_next, d) of nd-arrays.
         q_fn: DeepQNetwork
             Function for calculating state-action values.
@@ -287,7 +314,7 @@ def td_error(
             Array of size 1 holding the value of the loss.
     """
 
-    obs, acts, rewards, obs_next, done = batch
+    obs, acts, rewards, obs_next, done = ts
     B = obs.shape[0]
 
     # Compute the q-values for the current obs.
