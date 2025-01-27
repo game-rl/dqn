@@ -36,11 +36,11 @@ class OptimizerFn:
 		self.get_params = get_params
 		self.step = 0
 	def __call__(self, params, grads, opt_state):
-		max_norm = 10.
+		max_norm = 1.
 		leaves, _ = jax.tree.flatten(grads)
 		total_norm = jnp.sqrt(sum(jnp.vdot(x, x) for x in leaves))
 		clip_coef = max_norm / (total_norm + 1e-6)
-		clip_coef = jnp.maximum(clip_coef, 1.0)
+		clip_coef = jnp.minimum(clip_coef, 1.0)
 		grads = jax.tree.map(lambda g: clip_coef * g, grads) # clip grads
 		opt_state = self.opt_update(self.step, grads, opt_state)
 		params = self.get_params(opt_state)
@@ -76,7 +76,7 @@ def CartPole():
 	q_fn = jax.jit(apply_fn) # a callable that computes state-action values
 
 	# Define the OptimizerFn.
-	opt_init, opt_update, get_params = optim.adam(step_size=1e-3)
+	opt_init, opt_update, get_params = optim.adam(step_size=3e-4)
 	opt_state = opt_init(params)
 	optim_fn = OptimizerFn(jax.jit(opt_update), get_params)
 
@@ -137,7 +137,7 @@ def LunarLander():
 	q_fn = jax.jit(apply_fn) # a callable that computes state-action values
 
 	# Define the OptimizerFn.
-	opt_init, opt_update, get_params = optim.adam(step_size=1e-3)
+	opt_init, opt_update, get_params = optim.adam(step_size=3e-4)
 	opt_state = opt_init(params)
 	optim_fn = OptimizerFn(jax.jit(opt_update), get_params)
 
