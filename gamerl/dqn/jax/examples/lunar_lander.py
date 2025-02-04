@@ -17,10 +17,23 @@ from replay_buffers import VanillaReplayBuffer
 gym.logger.min_level = gym.logger.ERROR
 
 
-# DeepQNetwork is a Callable that computes Q-values.
-class DeepQNetwork:
+# DuelingQNetwork is a Callable that computes Q-values.
+class DuelingQNetwork:
 	def __init__(self, hidden_sizes, out_size):
-		init_fn, apply_fn = stax.serial(
+		v_init_fn, v_apply_fn = stax.serial(
+			*[
+				stax.serial(
+					stax.Dense(out_dim=h, W_init=glorot_uniform(), b_init=uniform(1e-2)),
+					stax.Tanh,
+				)
+				for h in hidden_sizes
+			],
+			stax.Dense(out_dim=1, W_init=glorot_uniform(), b_init=uniform(1e-2)),
+		)
+		self.v_init_fn = v_init_fn
+		self.v_apply_fn = jax.jit(v_apply_fn)
+
+		a_init_fn, a_apply_fn = stax.serial(
 			*[
 				stax.serial(
 					stax.Dense(out_dim=h, W_init=glorot_uniform(), b_init=uniform(1e-2)),
@@ -30,13 +43,20 @@ class DeepQNetwork:
 			],
 			stax.Dense(out_dim=out_size, W_init=glorot_uniform(), b_init=uniform(1e-2)),
 		)
-		self.init_fn = init_fn
-		self.apply_fn = jax.jit(apply_fn)
+		self.a_init_fn = a_init_fn
+		self.a_apply_fn = jax.jit(a_apply_fn)
+
 	def __call__(self, params, x):
-		return self.apply_fn(params, x)
+		v_params, a_params = params
+		values = self.v_apply_fn(v_params, x)
+		adv = self.a_apply_fn(a_params, x)
+		return values + (adv - adv.mean(axis=-1, keepdims=True))
+
 	def init_params(self, rng, in_shape):
-		_, params = self.init_fn(rng, (-1,) + in_shape)
-		return params
+		r1, r2 = jax.random.split(rng)
+		_, v_params = self.v_init_fn(r1, (-1,) + in_shape)
+		_, a_params = self.a_init_fn(r2, (-1,) + in_shape)
+		return (v_params, a_params)
 
 # EnvironmentStepFn is a Callable that steps the environment.
 class EnvironmentStepFn:
@@ -111,7 +131,7 @@ if __name__ == "__main__":
 	in_shape = env.single_observation_space.shape
 	out_size = env.single_action_space.n
 	rng, rng_ = jax.random.split(rng)
-	q_fn = DeepQNetwork(hidden_sizes, out_size)
+	q_fn = DuelingQNetwork(hidden_sizes, out_size)
 	params = q_fn.init_params(rng_, (-1,) + in_shape)
 
 	# Define the OptimizerFn.
