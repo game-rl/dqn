@@ -5,12 +5,10 @@ from functools import partial
 from typing import Any
 from typing import Callable
 from typing import Protocol
-import warnings
 
 import jax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
-import numpy as np
 from tqdm import tqdm
 
 
@@ -69,35 +67,37 @@ class ReplayBuffer(Protocol):
 	def sample(self, rng: Key, batch_size: int) -> Transitions:
 		"""Sample a batch of transitions from the buffer."""
 
-# DQNTrainer is a callable that trains an agent to maximize
+# DQNLearner is a callable that trains an agent to maximize
 # expected return from a given environment.
 @dataclass
-class DQNTrainer:
-	"""DQNTrainer trains a Q-network over multiple time-steps.
+class DQNLearner:
+	"""DQNLearner trains a Q-network over multiple time-steps.
 
-	At each time-step the environment is stepped and the transitions
-	are stored in the replay buffer. Once the agent has performed a
-	fixed amount of steps, the parameters of the q-network are updated
-	by drawing random batches from the buffer and optimizing using a
-	one-step TD target.
+	At each time-step the environment is stepped using an epsilon-
+	greedy policy from the computed Q-values. The transitions are
+	stored in the replay buffer. Once the agent has performed a
+	fixed amount of steps,the parameters of the q-network are
+	updated by drawing random batches from the buffer and
+	optimizing using a one-step TD target.
 
-	The q-network and the environment are provided to the trainer upon
-	initialization. The trainer can then be called multiple times to
-	update the network parameters. You can see how well the current
-	q-network is performing in between calling the trainer:
+	The q-network and the environment are provided to the trainer
+	upon initialization. The trainer can then be called multiple
+	times to update the network parameters. You can see how well
+	the current q-network is performing in between calling the
+	trainer:
 
 	```python
 	# Initialize the trainer.
-	dqn_trainer = DQNTrainer(q_fn, optim_fn, env_fn, **kwargs)
+	dqn_learner = DQNLearner(q_fn, optim_fn, env_fn, **kwargs)
 
 	# Call the trainer to update the current params.
-	params, opt_state = dqn_trainer(rng1, params, opt_state, n_steps, prefill_steps)
+	params, opt_state = dqn_learner(rng1, params, opt_state, n_steps, prefill_steps)
 
 	# Test the agent after training.
 	record_demo(env_fn, q_fn, params)
 
 	# Train the agent some more.
-	params, opt_state = dqn_trainer(rng2, params, opt_state, n_steps, 0)
+	params, opt_state = dqn_learner(rng2, params, opt_state, n_steps, 0)
 	```
 	"""
 
@@ -106,11 +106,11 @@ class DQNTrainer:
 	env_fn: EnvironmentStepFn
 	replay_buffer: ReplayBuffer
 	discount: float = 1.    # discount for future rewards
-	update_freq: int = 1    # how often to update the q-network
-	n_updates: int = 1      # number of updates per iteration
+	update_freq: int = -1   # how often to update the q-network
+	n_updates: int = -1     # number of updates per iteration
 	batch_size: int = 64    # batch size for iterating over the replay buffer
 	huber_delta: float = 1. # bound for the huber loss transform
-	p: float = 0.99         # factor for Polyak averaging
+	p: float = 0.995        # factor for Polyak averaging
 	eps: Callable[[int], float] = lambda x: 0.05 # schedule for epsi-greedy
 	train_log: dict[str, list[float]] = field( # for logging info during training
 		default_factory=lambda: defaultdict(list), init=False)
@@ -145,6 +145,9 @@ class DQNTrainer:
 		"""
 
 		n_envs = self.env_fn(None)[0].shape[0]
+		if self.update_freq < 0: self.update_freq = n_envs
+		if self.n_updates < 0: 	 self.n_updates = self.update_freq
+
 		self.train_log["hyperparams"].append({
 			"n_steps": n_steps,
 			"n_envs": n_envs,
@@ -152,18 +155,16 @@ class DQNTrainer:
 		})
 
 		tgt_params = deepcopy(params)   # tgt network params for double q-learning
-		ep_r, ep_l = [], []             # lists for storing episode stats
 		pbar = tqdm(total=n_steps)      # manual progress bar
 		steps = 0                       # total number of steps performed
 
 		while steps < n_steps:
-			s = 0               # inner loop steps counter
-			ep_r, ep_l = [], [] # lists for storing episode stats
+			s = 0 # inner loop steps counter
 
 			# Continue stepping the environment until it is time for update.
 			while s < self.update_freq:
 				# Step the environment and store the transitions.
-				rng, rng_ = jax.random.split(rng, num=2)
+				rng, rng_ = jax.random.split(rng)
 				ts, info = step(rng_, self.env_fn, self.q_fn, params, eps=self.eps(steps+s))
 				self.replay_buffer.store(ts)
 
@@ -172,29 +173,21 @@ class DQNTrainer:
 				pbar.update(n_envs)
 
 				# Bookkeeping.
-				ep_r.extend(info["ep_r"])
-				ep_l.extend(info["ep_l"])
+				self.train_log["ep_r"].extend(info["ep_r"])
+				self.train_log["ep_l"].extend(info["ep_l"])
 
-			steps += s              # update the total step counter
-			losses, norms = [], []  # lists for storing training stats
-
+			steps += s # update the total step counter
 			if steps < prefill_steps: continue
 
 			# Update the parameters of the q-network.
 			for _ in range(self.n_updates):
-				rng, rng_ = jax.random.split(rng, num=2)
+				rng, rng_ = jax.random.split(rng)
 				ts = self.replay_buffer.sample(rng_, self.batch_size)
 
 				# Compute the loss.
 				loss, grads = td_error(
 					ts, self.q_fn, params, tgt_params, self.discount, self.huber_delta,
 				)
-
-				# Bookkeeping.
-				leaves, _ = jax.tree.flatten(grads)
-				grad_norm = jnp.sqrt(sum(jnp.vdot(x, x) for x in leaves))
-				losses.append(loss.item())
-				norms.append(grad_norm.item())
 
 				# Backward pass. Update the parameters of the q-network.
 				params, opt_state = self.optim_fn(params, grads, opt_state)
@@ -204,16 +197,11 @@ class DQNTrainer:
 					lambda x, y: self.p*x+(1-self.p)*y, tgt_params, params,
 				)
 
-			# Bookkeeping. Store training stats averaged over the number of
-			# updates. Store episode stats averaged over the time-steps.
-			self.train_log["loss"].append((np.mean(losses), np.std(losses)))
-			self.train_log["grad_norm"].append((np.mean(norms), np.std(norms)))
-			with warnings.catch_warnings():
-				# We might have not completed any episodes this iteration.
-				# Just store NaNs and ignore the warning.
-				warnings.simplefilter("ignore", category=RuntimeWarning)
-				self.train_log["ep_r"].append((np.mean(ep_r), np.std(ep_r)))
-				self.train_log["ep_l"].append((np.mean(ep_l), np.std(ep_l)))
+				# Bookkeeping.
+				leaves, _ = jax.tree.flatten(grads)
+				grad_norm = jnp.sqrt(sum(jnp.vdot(x, x) for x in leaves))
+				self.train_log["loss"].append(loss.item())
+				self.train_log["grad_norm"].append(grad_norm.item())
 
 		pbar.close()
 
@@ -254,9 +242,9 @@ def step(
 	# Select the actions using eps-greedy.
 	q_values = q_fn(params, o) # shape (B, acts)
 	B, A = q_values.shape
-	rng, rng_ = jax.random.split(rng, num=2)
+	rng, rng_ = jax.random.split(rng)
 	if jax.random.uniform(rng_) < eps:
-		rng, rng_ = jax.random.split(rng, num=2)
+		rng, rng_ = jax.random.split(rng)
 		acts = jax.random.randint(rng_, shape=(B,), minval=0, maxval=A, dtype=int)
 	else:
 		acts = jnp.argmax(q_values, axis=-1)
@@ -273,8 +261,8 @@ def step(
 	transitions = (o, acts, r, o_next, (t | tr))
 
 	info = {
-		"ep_r": [infos["episode"]["r"][k] for k in range(B) if (t | tr)[k]],
-		"ep_l": [infos["episode"]["l"][k] for k in range(B) if (t | tr)[k]],
+		"ep_r": [float(infos["episode"]["r"][k]) for k in range(B) if (t | tr)[k]],
+		"ep_l": [float(infos["episode"]["l"][k]) for k in range(B) if (t | tr)[k]],
 	}
 
 	return transitions, info
