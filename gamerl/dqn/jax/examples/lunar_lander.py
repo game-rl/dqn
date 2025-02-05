@@ -112,19 +112,17 @@ if __name__ == "__main__":
 	# Each sub-environment has a different set of random parameters,
 	# that are clipped to stay in the recommended parameter space.
 	rng, rng_ = jax.random.split(rng)
-	env = gym.wrappers.vector.RecordEpisodeStatistics(
-		gym.vector.SyncVectorEnv([
-			lambda: gym.make(
-				"LunarLander-v3",
-				gravity=np.clip(np.random.normal(-10.0, 1.0), -11.99, -0.01),
-				enable_wind=np.random.choice([True, False]),
-				wind_power=np.clip(np.random.normal(15.0, 1.0), 0.01, 19.99),
-				turbulence_power=np.clip(np.random.normal(1.5, 0.5), 0.01, 1.99),
-				max_episode_steps=steps_limit,
-			)
-			for _ in range(n_envs)
-		]),
-	)
+	env = gym.vector.SyncVectorEnv([
+		lambda: gym.make(
+			"LunarLander-v3",
+			gravity=np.clip(np.random.normal(-10.0, 1.0), -11.99, -0.01),
+			enable_wind=np.random.choice([True, False]),
+			wind_power=np.clip(np.random.normal(15.0, 1.0), 0.01, 19.99),
+			turbulence_power=np.clip(np.random.normal(1.5, 0.5), 0.01, 1.99),
+			max_episode_steps=steps_limit,
+		)
+		for _ in range(n_envs)
+	])
 	env_fn = EnvironmentStepFn(rng_, env)
 
 	# Define the DQN function.

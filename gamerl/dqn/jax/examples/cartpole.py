@@ -95,7 +95,6 @@ if __name__ == "__main__":
 		num_envs=n_envs,
 		vectorization_mode=gym.VectorizeMode.SYNC,
 		max_episode_steps=steps_limit,
-		wrappers=[gym.wrappers.RecordEpisodeStatistics],
 	)
 	env_fn = EnvironmentStepFn(rng_, env)
 
