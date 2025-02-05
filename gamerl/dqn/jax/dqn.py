@@ -149,9 +149,11 @@ class DQNLearner:
 		if self.update_freq < 0: self.update_freq = n_envs
 		if self.n_updates < 0: 	 self.n_updates = self.update_freq
 
-		tgt_params = deepcopy(params)   # tgt network params for double q-learning
+		tgt_params = deepcopy(params)   # tgt network params
 		pbar = tqdm(total=n_steps)      # manual progress bar
 		steps = 0                       # total number of steps performed
+		ep_r = np.zeros(n_envs)			# record episode statistics
+		ep_l = np.zeros(n_envs)
 
 		while steps < n_steps:
 			s = 0 # inner loop steps counter
@@ -160,7 +162,8 @@ class DQNLearner:
 			while s < self.update_freq:
 				# Step the environment and store the transitions.
 				rng, rng_ = jax.random.split(rng)
-				ts, info = step(rng_, self.env_fn, self.q_fn, params, eps=self.eps(steps+s))
+				eps = self.eps(steps+s)
+				ts = step(rng_, self.env_fn, self.q_fn, params, eps)
 				self.replay_buffer.store(ts)
 
 				# Stepping the environment once actually performs `n_envs` steps.
@@ -168,8 +171,14 @@ class DQNLearner:
 				pbar.update(n_envs)
 
 				# Bookkeeping.
-				self.train_log["ep_r"].extend(info["ep_r"])
-				self.train_log["ep_l"].extend(info["ep_l"])
+				_, _, r, _, done = ts
+				done = np.atleast_1d(done)
+				ep_r += r
+				ep_l += 1
+				self.train_log["ep_r"].extend(np.where(done, ep_r, np.nan))
+				self.train_log["ep_l"].extend(np.where(done, ep_l, np.nan))
+				ep_r[done] = 0
+				ep_l[done] = 0
 
 			steps += s # update the total step counter
 			if steps < prefill_steps: continue
@@ -229,8 +238,6 @@ def step(
 	Returns:
 		Transitions
 			Tuple (o, a, r, o_next, d) of nd-arrays.
-		dict[str, Sequence[float]]
-			Info dict.
 	"""
 	o, *_ = env_fn(None) # shape (B, *)
 
@@ -245,7 +252,7 @@ def step(
 		acts = jnp.argmax(q_values, axis=-1)
 
 	# Step the environment.
-	o_next, r, t, tr, infos = env_fn(acts)
+	o_next, r, t, tr, _ = env_fn(acts)
 
 	# If any of the sub-envs is truncated then read o_next from the info dict.
 	# Transitions in **truncated** environments are stored as **not done**.
@@ -255,19 +262,7 @@ def step(
 	# transitions = (o, acts, r, o_next, t)
 	transitions = (o, acts, r, o_next, (t | tr))
 
-	# Read the episode statistics. At every step store the episode return
-	# episode length. Store ``nan`` if the episode is not finished.
-	done = np.asarray(t | tr, dtype=bool)
-	if "episode" not in infos.keys() or "r" not in infos["episode"].keys():
-		infos["episode"] = {
-			"r": np.zeros_like(done, dtype=float),
-			"l": np.zeros_like(done, dtype=float),
-		}
-	ep_r = np.where(done, np.asarray(infos["episode"]["r"]), np.nan)
-	ep_l = np.where(done, np.asarray(infos["episode"]["l"]), np.nan)
-	info = {"ep_r": ep_r, "ep_l": ep_l}
-
-	return transitions, info
+	return transitions
 
 # Differentiate the output of the function with respect to the
 # third input parameter, i.e. the parameters of the q-network.
