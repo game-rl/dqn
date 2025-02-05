@@ -9,6 +9,7 @@ from typing import Protocol
 import jax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
+import numpy as np
 from tqdm import tqdm
 
 
@@ -148,12 +149,6 @@ class DQNLearner:
 		if self.update_freq < 0: self.update_freq = n_envs
 		if self.n_updates < 0: 	 self.n_updates = self.update_freq
 
-		self.train_log["hyperparams"].append({
-			"n_steps": n_steps,
-			"n_envs": n_envs,
-			"n_updates": self.n_updates,
-		})
-
 		tgt_params = deepcopy(params)   # tgt network params for double q-learning
 		pbar = tqdm(total=n_steps)      # manual progress bar
 		steps = 0                       # total number of steps performed
@@ -260,10 +255,17 @@ def step(
 	# transitions = (o, acts, r, o_next, t)
 	transitions = (o, acts, r, o_next, (t | tr))
 
-	info = {
-		"ep_r": [float(infos["episode"]["r"][k]) for k in range(B) if (t | tr)[k]],
-		"ep_l": [float(infos["episode"]["l"][k]) for k in range(B) if (t | tr)[k]],
-	}
+	# Read the episode statistics. At every step store the episode return
+	# episode length. Store ``nan`` if the episode is not finished.
+	done = np.asarray(t | tr, dtype=bool)
+	if "episode" not in infos.keys() or "r" not in infos["episode"].keys():
+		infos["episode"] = {
+			"r": np.zeros_like(done, dtype=float),
+			"l": np.zeros_like(done, dtype=float),
+		}
+	ep_r = np.where(done, np.asarray(infos["episode"]["r"]), np.nan)
+	ep_l = np.where(done, np.asarray(infos["episode"]["l"]), np.nan)
+	info = {"ep_r": ep_r, "ep_l": ep_l}
 
 	return transitions, info
 

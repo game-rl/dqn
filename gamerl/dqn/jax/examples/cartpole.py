@@ -83,7 +83,6 @@ if __name__ == "__main__":
 	lr = 5e-4
 	buffer_capacity = 50000
 	discount = 0.8
-	n_updates = 100
 	batch_size = 128
 	n_steps = int(1e6)
 	prefill_steps = 50000
@@ -91,8 +90,12 @@ if __name__ == "__main__":
 
 	# Define the EnvironmentStepFn.
 	rng, rng_ = jax.random.split(rng)
-	env = gym.wrappers.vector.RecordEpisodeStatistics(
-		gym.make_vec("CartPole-v1", num_envs=n_envs, vectorization_mode="sync"),
+	env = gym.make_vec(
+		id="CartPole-v1",
+		num_envs=n_envs,
+		vectorization_mode=gym.VectorizeMode.SYNC,
+		max_episode_steps=steps_limit,
+		wrappers=[gym.wrappers.RecordEpisodeStatistics],
 	)
 	env_fn = EnvironmentStepFn(rng_, env)
 
@@ -114,7 +117,7 @@ if __name__ == "__main__":
 	# Define the DQN Trainer.
 	dqn_learner = DQNLearner(
 		q_fn, optim_fn, env_fn, buffer,
-		discount=discount, batch_size=batch_size, #n_updates=n_updates,
+		discount=discount, batch_size=batch_size,
 		eps=eps,
 	)
 
@@ -147,7 +150,6 @@ if __name__ == "__main__":
 	# Generate plots.
 	plt.style.use("seaborn-v0_8") # ggplot
 	for k in dqn_learner.train_log.keys():
-		if k == "hyperparams": continue # skip this
 
 		fig, ax = plt.subplots()
 
@@ -155,10 +157,6 @@ if __name__ == "__main__":
 		avg_every = total // 100
 		xs = np.arange(total)[::avg_every]
 		ys = dqn_learner.train_log[k]
-
-		if k in ["ep_r", "ep_l"]:
-			total_steps = dqn_learner.train_log["hyperparams"][0]["n_steps"]
-			xs = np.linspace(0, total_steps, len(xs))
 
 		# xs has `ceil(total / avg_every)` elements.
 		# We may need to pad the ys.

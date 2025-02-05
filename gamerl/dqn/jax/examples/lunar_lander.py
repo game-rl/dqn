@@ -146,7 +146,6 @@ if __name__ == "__main__":
 	dqn_learner = DQNLearner(
 		q_fn, optim_fn, env_fn, buffer,
 		discount=discount, batch_size=batch_size,
-		# n_updates=n_updates,
 		eps=eps,
 	)
 
@@ -179,7 +178,6 @@ if __name__ == "__main__":
 	# Generate plots.
 	plt.style.use("seaborn-v0_8") # ggplot
 	for k in dqn_learner.train_log.keys():
-		if k == "hyperparams": continue # skip this
 
 		fig, ax = plt.subplots()
 
@@ -187,10 +185,6 @@ if __name__ == "__main__":
 		avg_every = total // 100
 		xs = np.arange(total)[::avg_every]
 		ys = dqn_learner.train_log[k]
-
-		if k in ["ep_r", "ep_l"]:
-			total_steps = dqn_learner.train_log["hyperparams"][0]["n_steps"]
-			xs = np.linspace(0, total_steps, len(xs))
 
 		# xs has `ceil(total / avg_every)` elements.
 		# We may need to pad the ys.
