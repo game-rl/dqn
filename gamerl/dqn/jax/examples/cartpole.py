@@ -1,3 +1,4 @@
+from collections import deque
 import os
 import sys
 sys.path.append("..")
@@ -12,10 +13,19 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from dqn import DQNLearner
-from replay_buffers import VanillaReplayBuffer
 
 gym.logger.min_level = gym.logger.ERROR
 
+
+class VanillaReplayBuffer:
+	"""Really slow. Just for illustration purposes."""
+	def __init__(self, capacity):
+		self.buffer = deque([], maxlen=capacity)
+	def store(self, ts):
+		self.buffer.append(ts)
+	def sample(self, rng, batch_size):
+		idxs = jax.random.randint(rng, shape=(batch_size,), minval=0, maxval=len(self.buffer))
+		return [ np.stack(x) for x in zip(*(self.buffer[i] for i in idxs)) ]
 
 # DeepQNetwork is a Callable that computes Q-values.
 class DeepQNetwork:
@@ -59,12 +69,6 @@ class OptimizerFn:
 		self.get_params = get_params
 		self.step = 0
 	def __call__(self, params, grads, opt_state):
-		max_norm = 1.
-		leaves, _ = jax.tree.flatten(grads)
-		total_norm = jnp.sqrt(sum(jnp.vdot(x, x) for x in leaves))
-		clip_coef = max_norm / (total_norm + 1e-6)
-		clip_coef = jnp.minimum(clip_coef, 1.0)
-		grads = jax.tree.map(lambda g: clip_coef * g, grads) # clip grads
 		opt_state = self.opt_update(self.step, grads, opt_state)
 		params = self.get_params(opt_state)
 		self.step += 1
@@ -73,35 +77,30 @@ class OptimizerFn:
 
 if __name__ == "__main__":
 
-	np.random.seed(seed=0)
-	rng = jax.random.PRNGKey(seed=0)
+	np.random.seed(seed=1234)
+	rng = jax.random.PRNGKey(seed=1234)
 
 	# Hyperparameters.
-	n_envs = 32
 	steps_limit = 500
 	hidden_sizes = [64]
-	lr = 5e-4
-	buffer_capacity = 50000
-	discount = 0.8
+	lr = 1e-4
+	buffer_capacity = 20000
+	discount = 0.99
 	batch_size = 128
-	n_steps = int(1e6)
-	prefill_steps = 50000
-	eps = lambda i: max((3e5-i)/3e5 * 0.14 + 0.02, 0.02) # 0.16 --> 0.02 --> 0.02
+	n_steps = int(3e5)
+	prefill_steps = 20000
+	eps = lambda i: (n_steps-i)/n_steps * 0.12 + 0.04 # 0.16 --> 0.04
 
 	# Define the EnvironmentStepFn.
 	rng, rng_ = jax.random.split(rng)
-	env = gym.make_vec(
-		id="CartPole-v1",
-		num_envs=n_envs,
-		vectorization_mode=gym.VectorizeMode.SYNC,
-		max_episode_steps=steps_limit,
+	env = gym.wrappers.Autoreset(
+		gym.make("CartPole-v1", max_episode_steps=steps_limit),
 	)
 	env_fn = EnvironmentStepFn(rng_, env)
 
 	# Define the DQN function.
-	in_shape = env.single_observation_space.shape
-	out_size = env.single_action_space.n
-	rng, rng_ = jax.random.split(rng)
+	in_shape = env.observation_space.shape
+	out_size = env.action_space.n
 	q_fn = DeepQNetwork(hidden_sizes, out_size)
 	params = q_fn.init_params(rng_, (-1,) + in_shape)
 
@@ -111,16 +110,13 @@ if __name__ == "__main__":
 	optim_fn = OptimizerFn(jax.jit(opt_update), get_params)
 
 	# Define the ReplayBuffer.
-	buffer = VanillaReplayBuffer(capacity=buffer_capacity, obs_shape=in_shape)
+	buffer = VanillaReplayBuffer(capacity=buffer_capacity)
 
-	# Define the DQN Trainer.
+	# Define and run the DQN Trainer.
 	dqn_learner = DQNLearner(
 		q_fn, optim_fn, env_fn, buffer,
-		discount=discount, batch_size=batch_size,
-		eps=eps,
+		discount=discount, batch_size=batch_size, eps=eps,
 	)
-
-	# Run the trainer.
 	rng, rng_ = jax.random.split(rng)
 	params, _ = dqn_learner(rng_, params, opt_state, n_steps, prefill_steps)
 
@@ -128,7 +124,7 @@ if __name__ == "__main__":
 	log_dir = "CartPole-v1"
 	os.makedirs(log_dir, exist_ok=True)
 
-	# Record demo with the trained agent.
+	# Record a demo with the trained agent.
 	env = gym.wrappers.RecordVideo(
 		gym.wrappers.Autoreset(
 			gym.make("CartPole-v1", render_mode="rgb_array"),
@@ -149,41 +145,15 @@ if __name__ == "__main__":
 	# Generate plots.
 	plt.style.use("seaborn-v0_8") # ggplot
 	for k in dqn_learner.train_log.keys():
-
 		fig, ax = plt.subplots()
-
-		total = len(dqn_learner.train_log[k])
-		avg_every = total // 100
-		xs = np.arange(total)[::avg_every]
-		ys = dqn_learner.train_log[k]
-
-		# xs has `ceil(total / avg_every)` elements.
-		# We may need to pad the ys.
-		avg = np.nanmean(np.pad(
-			ys,
-			(0, -len(ys)%avg_every),
-			constant_values=np.nan,
-		).reshape(-1, avg_every), axis=1)
-		std = np.nanstd(np.pad(
-			ys,
-			(0, -len(ys)%avg_every),
-			constant_values=np.nan,
-		).reshape(-1, avg_every), axis=1)
-
-		# Remove NaNs, if any.
-		xs = xs[~(avg != avg)]
-		avg = avg[~(avg != avg)]
-		std = std[~(std != std)]
-
-		# Plot the avg and the std.
-		ax.plot(xs, avg, label=k)
-		ax.fill_between(xs, avg-0.5*std, avg+0.5*std, color="k", alpha=0.25)
-
-		x_label = "Total time-steps" if k in {"ep_r", "ep_l"} else "Gradient updates"
-		ax.set_xlabel(x_label)
+		ys = np.array(dqn_learner.train_log[k])
+		xs = np.arange(len(ys))
+		xs = xs[~(ys != ys)]
+		ys = ys[~(ys != ys)] # remove NaNs
+		ax.plot(xs, ys, label=k)
+		ax.set_xlabel("steps")
 		ax.set_ylabel(k)
 		ax.ticklabel_format(style="sci", axis="x", scilimits=(0,0))
-		ax.legend()
 		fig.savefig(os.path.join(log_dir, k +".png"))
 
 #
