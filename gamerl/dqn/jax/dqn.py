@@ -31,26 +31,22 @@ DeepQNetwork = Callable[[PyTree, ArrayLike], jax.Array]
 # optimizer state and returns the updated parameters and the new state.
 OptimizerFn = Callable[[PyTree, PyTree, OptState], tuple[PyTree, OptState]]
 
-# EnvironmentStepFn is a step function for a vectorized
-# environment conforming to the Gymnasium environments API. See:
+# EnvironmentStepFn is a step function for an environment conforming to
+# the Gymnasium environments API. See:
 #   https://gymnasium.farama.org/api/env/#gymnasium.Env.step
 #   https://gymnasium.farama.org/api/vector/#gymnasium.vector.VectorEnv.step
 #
-# The function takes as input a batch of actions to update the
-# environment state, and returns the next observations and the
-# rewards resulting from the actions. The function also returns
-# boolean arrays indicating whether any of the sub-environments
-# were terminated or truncated, as well as an info dict.
-#
-# If ``None`` is given as input, then the function returns the
-# current observations without stepping the environment.
+# Both vectorized and non-vectorized environments are supported.
+# The environment must be automatically reset when a terminal
+# state is reached. The info dict is not used.
 EnvironmentStepFn = Callable[
-	[ArrayLike | None],
-	tuple[jax.Array, jax.Array, jax.Array, jax.Array, dict],
+	[ArrayLike],
+	tuple[ArrayLike, ArrayLike, ArrayLike, ArrayLike, dict],
 ]
+"""EnvironmentStepFn implements the OpenAI Gym env.step() API with autoreset."""
 
 # Transitions is a tuple (o, a, r, o_next, d) of nd-arrays containing:
-#   - batch of observations ``o``;
+#   - one or more observations ``o``;
 #   - the selected actions ``a`` for each observation;
 #   - the obtained rewards ``r``;
 #   - the next observations ``o_next``;
@@ -59,12 +55,9 @@ Transitions = tuple[ArrayLike, ArrayLike, ArrayLike, ArrayLike, ArrayLike]
 """Tuple (o, a, r, o_next, d) of nd-arrays."""
 
 # ReplayBuffer is a container for storing and sampling transitions.
-# Implementations might include strategies for prioritized sampling of
-# transitions, smart eviction of old experiences, and others.
 class ReplayBuffer(Protocol):
 	def store(self, ts: Transitions) -> None:
-		"""Store a batch of transitions in the buffer possibly overwriting old ones."""
-
+		"""Store a transition from stepping the environment once."""
 	def sample(self, rng: Key, batch_size: int) -> Transitions:
 		"""Sample a batch of transitions from the buffer."""
 
@@ -92,13 +85,15 @@ class DQNLearner:
 	dqn_learner = DQNLearner(q_fn, optim_fn, env_fn, **kwargs)
 
 	# Call the trainer to update the current params.
-	params, opt_state = dqn_learner(rng1, params, opt_state, n_steps, prefill_steps)
+	init_obs, _ = env.reset()
+	params, opt_state = dqn_learner(rng1, params, opt_state, init_obs, n_steps, prefill_steps)
 
 	# Test the agent after training.
 	record_demo(env_fn, q_fn, params)
 
 	# Train the agent some more.
-	params, opt_state = dqn_learner(rng2, params, opt_state, n_steps, 0)
+	init_obs, _ = env.reset()
+	params, opt_state = dqn_learner(rng2, params, opt_state, init_obs, n_steps, 0)
 	```
 	"""
 
@@ -152,35 +147,29 @@ class DQNLearner:
 		pbar = tqdm(total=n_steps)      # manual progress bar
 		steps = 0                       # total number of steps performed
 		ep_r, ep_l = None, None			# record episode statistics
+		done = None						# track when an episode is done
 		obs = init_obs
 
 		while steps < n_steps:
 			s = 0 # inner loop steps counter
 
-			# Continue stepping the environment until it is time for update.
+			# Continue stepping the environment until it is time for an update.
 			while s < self.update_freq:
 				# Step the environment and store the transitions.
 				rng, rng_ = jax.random.split(rng)
 				eps = self.eps(steps+s)
-				ts = step(rng_, self.env_fn, self.q_fn, params, obs, eps)
+				ts, ep_r, ep_l = step(
+					rng_, self.env_fn, self.q_fn, params, obs, eps, done, ep_r, ep_l,
+				)
 				self.replay_buffer.store(ts)
 
 				# Bookkeeping.
-				_, _, r, next_obs, done = ts
-				r = np.atleast_1d(r)
-				done = np.atleast_1d(done)
-				if ep_r is None:
-					ep_r, ep_l = np.zeros_like(r), np.zeros_like(r, dtype=int)
-				ep_r += r
-				ep_l += 1
+				_, _, _, obs, done = ts # advance to the next observation
 				self.train_log["ep_r"].extend(np.where(done, ep_r, np.nan))
 				self.train_log["ep_l"].extend(np.where(done, ep_l, np.nan))
-				ep_r[done] = 0
-				ep_l[done] = 0
-				obs = next_obs
 
 				# Stepping the environment once actually performs `n_envs` steps.
-				n_envs = r.shape[0]
+				n_envs = done.shape[0]
 				s += n_envs
 				pbar.update(n_envs)
 
@@ -189,7 +178,8 @@ class DQNLearner:
 
 			# If ``updates_per_step`` is negative, then perform as many updates
 			# as steps in the environment.
-			n_updates = self.updates_per_step if self.updates_per_step > 0 else s
+			# n_updates = s * max(self.updates_per_step, 1)
+			n_updates = s * self.updates_per_step if self.updates_per_step > 0 else s
 
 			# Update the parameters of the q-network.
 			for _ in range(n_updates):
@@ -229,7 +219,10 @@ def step(
 	params: PyTree,
 	o: ArrayLike,
 	eps: float,
-) -> Transitions:
+	prev_done: ArrayLike | None,
+	ep_r: ArrayLike | None,
+	ep_l: ArrayLike | None,
+) -> tuple[Transitions, np.array, np.array]:
 	"""Step the environment and return the observed transition.
 
 	Args:
@@ -245,10 +238,20 @@ def step(
 			Current observation of the environment state.
 		eps: float
 			Epsilon value for epsilon-greedy action selection.
+		prev_done: ArrayLike | None
+			Boolean array indicating which of the observations are done.
+		ep_r: ArrayLike | None
+			Array containing the current accumulated rewards.
+		ep_l: ArrayLike | None
+			Array containing the current episode lengths.
 
 	Returns:
 		Transitions
 			Tuple (o, a, r, o_next, d) of nd-arrays.
+		np.array
+			The updated accumulated rewards.
+		np.array
+			The updated episode lengths.
 	"""
 
 	# Select the actions using eps-greedy.
@@ -266,12 +269,23 @@ def step(
 	# Step the environment.
 	o_next, r, t, tr, _ = env_fn(acts)
 
+	# Bookkeeping.
+	r = np.atleast_1d(r)
+	done = np.atleast_1d(t | tr)
+	if prev_done is None: prev_done = np.ones_like(done, dtype=bool)
+	if ep_r is None: ep_r = np.zeros_like(r)
+	if ep_l is None: ep_l = np.zeros_like(r, dtype=int)
+	ep_r[prev_done] = 0
+	ep_l[prev_done] = 0
+	ep_r += r
+	ep_l += 1
+
 	# TODO:
 	# If any of the sub-envs is truncated then read o_next from the info dict.
 	# transitions = (o, acts, r, o_next, t)
-	transitions = (o, acts, r, o_next, (t | tr))
+	transitions = (o, acts, r, o_next, done)
 
-	return transitions
+	return transitions, ep_r, ep_l
 
 # Differentiate the output of the function with respect to the
 # third input parameter, i.e. the parameters of the q-network.

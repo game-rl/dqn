@@ -17,7 +17,7 @@ from dqn import DQNLearner
 gym.logger.min_level = gym.logger.ERROR
 
 
-class VanillaReplayBuffer:
+class NaiveReplayBuffer:
 	"""Really slow. Just for illustration purposes."""
 	def __init__(self, capacity):
 		self.buffer = deque([], maxlen=capacity)
@@ -98,7 +98,7 @@ if __name__ == "__main__":
 	optim_fn = OptimizerFn(jax.jit(opt_update), get_params)
 
 	# Define the ReplayBuffer.
-	buffer = VanillaReplayBuffer(capacity=buffer_capacity)
+	buffer = NaiveReplayBuffer(capacity=buffer_capacity)
 
 	# Define and run the DQN Trainer.
 	dqn_learner = DQNLearner(
