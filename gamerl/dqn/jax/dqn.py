@@ -70,7 +70,7 @@ class ReplayBuffer(Protocol):
 
 # DQNLearner is a callable that trains an agent to maximize
 # expected return from a given environment.
-@dataclass
+@dataclass(init=True, repr=False, eq=False)
 class DQNLearner:
 	"""DQNLearner trains a Q-network over multiple time-steps.
 
@@ -106,12 +106,12 @@ class DQNLearner:
 	optim_fn: OptimizerFn
 	env_fn: EnvironmentStepFn
 	replay_buffer: ReplayBuffer
-	discount: float = 1.    # discount for future rewards
-	update_freq: int = -1   # how often to update the q-network
-	n_updates: int = -1     # number of updates per iteration
-	batch_size: int = 64    # batch size for iterating over the replay buffer
-	huber_delta: float = 1. # bound for the huber loss transform
-	p: float = 0.995        # factor for Polyak averaging
+	discount: float = 1.    	# discount for future rewards
+	update_freq: int = 1    	# how often to update the q-network
+	updates_per_step: int = -1	# number of updates per environment step
+	batch_size: int = 64    	# batch size for iterating over the replay buffer
+	huber_delta: float = 1. 	# bound for the huber loss transform
+	p: float = 0.995        	# factor for Polyak averaging
 	eps: Callable[[int], float] = lambda x: 0.05 # schedule for epsi-greedy
 	train_log: dict[str, list[float]] = field( # for logging info during training
 		default_factory=lambda: defaultdict(list), init=False)
@@ -145,15 +145,10 @@ class DQNLearner:
 				The latest state of the optimizer.
 		"""
 
-		n_envs = self.env_fn(None)[0].shape[0]
-		if self.update_freq < 0: self.update_freq = n_envs
-		if self.n_updates < 0: 	 self.n_updates = self.update_freq
-
 		tgt_params = deepcopy(params)   # tgt network params
 		pbar = tqdm(total=n_steps)      # manual progress bar
 		steps = 0                       # total number of steps performed
-		ep_r = np.zeros(n_envs)			# record episode statistics
-		ep_l = np.zeros(n_envs)
+		ep_r, ep_l = None, None			# record episode statistics
 
 		while steps < n_steps:
 			s = 0 # inner loop steps counter
@@ -166,13 +161,12 @@ class DQNLearner:
 				ts = step(rng_, self.env_fn, self.q_fn, params, eps)
 				self.replay_buffer.store(ts)
 
-				# Stepping the environment once actually performs `n_envs` steps.
-				s += n_envs
-				pbar.update(n_envs)
-
 				# Bookkeeping.
 				_, _, r, _, done = ts
+				r = np.atleast_1d(r)
 				done = np.atleast_1d(done)
+				if ep_r is None:
+					ep_r, ep_l = np.zeros_like(r), np.zeros_like(r, dtype=int)
 				ep_r += r
 				ep_l += 1
 				self.train_log["ep_r"].extend(np.where(done, ep_r, np.nan))
@@ -180,11 +174,20 @@ class DQNLearner:
 				ep_r[done] = 0
 				ep_l[done] = 0
 
+				# Stepping the environment once actually performs `n_envs` steps.
+				n_envs = r.shape[0]
+				s += n_envs
+				pbar.update(n_envs)
+
 			steps += s # update the total step counter
 			if steps < prefill_steps: continue
 
+			# If ``updates_per_step`` is negative, then perform as many updates
+			# as steps in the environment.
+			n_updates = self.updates_per_step if self.updates_per_step > 0 else s
+
 			# Update the parameters of the q-network.
-			for _ in range(self.n_updates):
+			for _ in range(n_updates):
 				rng, rng_ = jax.random.split(rng)
 				ts = self.replay_buffer.sample(rng_, self.batch_size)
 
@@ -220,7 +223,7 @@ def step(
 	q_fn: DeepQNetwork,
 	params: PyTree,
 	eps: float,
-) -> tuple[Transitions, dict]:
+) -> Transitions:
 	"""Step the environment and return the observed transition.
 
 	Args:
@@ -239,26 +242,25 @@ def step(
 		Transitions
 			Tuple (o, a, r, o_next, d) of nd-arrays.
 	"""
-	o, *_ = env_fn(None) # shape (B, *)
+	o, *_ = env_fn(None)
 
 	# Select the actions using eps-greedy.
-	q_values = q_fn(params, o) # shape (B, acts)
-	B, A = q_values.shape
+	q_values = q_fn(params, o) # shape (B, acts) or (acts,)
+	B, A = np.atleast_2d(q_values).shape
 	rng, rng_ = jax.random.split(rng)
 	if jax.random.uniform(rng_) < eps:
 		rng, rng_ = jax.random.split(rng)
 		acts = jax.random.randint(rng_, shape=(B,), minval=0, maxval=A, dtype=int)
+		if len(q_values.shape) == 1: # non-vectorized envs accept a single value as act
+			acts = acts.squeeze()
 	else:
 		acts = jnp.argmax(q_values, axis=-1)
 
 	# Step the environment.
 	o_next, r, t, tr, _ = env_fn(acts)
 
+	# TODO:
 	# If any of the sub-envs is truncated then read o_next from the info dict.
-	# Transitions in **truncated** environments are stored as **not done**.
-	if tr.any():
-		pass #>
-
 	# transitions = (o, acts, r, o_next, t)
 	transitions = (o, acts, r, o_next, (t | tr))
 
