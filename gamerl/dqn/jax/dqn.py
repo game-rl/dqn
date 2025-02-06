@@ -121,6 +121,7 @@ class DQNLearner:
 		rng: Key,
 		params: PyTree,
 		opt_state: OptState,
+		init_obs: ArrayLike,
 		n_steps: int,
 		prefill_steps: int,
 	) -> tuple[PyTree, OptState]:
@@ -133,6 +134,8 @@ class DQNLearner:
 				Current parameters for the q-network.
 			opt_state: OptState
 				Current optimizer state for the optimizer function.
+			init_obs: ArrayLike
+				Initial observation of the environment.
 			n_steps: int
 				Total number of time-steps to be performed.
 			prefill_steps: int
@@ -149,6 +152,7 @@ class DQNLearner:
 		pbar = tqdm(total=n_steps)      # manual progress bar
 		steps = 0                       # total number of steps performed
 		ep_r, ep_l = None, None			# record episode statistics
+		obs = init_obs
 
 		while steps < n_steps:
 			s = 0 # inner loop steps counter
@@ -158,11 +162,11 @@ class DQNLearner:
 				# Step the environment and store the transitions.
 				rng, rng_ = jax.random.split(rng)
 				eps = self.eps(steps+s)
-				ts = step(rng_, self.env_fn, self.q_fn, params, eps)
+				ts = step(rng_, self.env_fn, self.q_fn, params, obs, eps)
 				self.replay_buffer.store(ts)
 
 				# Bookkeeping.
-				_, _, r, _, done = ts
+				_, _, r, next_obs, done = ts
 				r = np.atleast_1d(r)
 				done = np.atleast_1d(done)
 				if ep_r is None:
@@ -173,6 +177,7 @@ class DQNLearner:
 				self.train_log["ep_l"].extend(np.where(done, ep_l, np.nan))
 				ep_r[done] = 0
 				ep_l[done] = 0
+				obs = next_obs
 
 				# Stepping the environment once actually performs `n_envs` steps.
 				n_envs = r.shape[0]
@@ -222,6 +227,7 @@ def step(
 	env_fn: EnvironmentStepFn,
 	q_fn: DeepQNetwork,
 	params: PyTree,
+	o: ArrayLike,
 	eps: float,
 ) -> Transitions:
 	"""Step the environment and return the observed transition.
@@ -235,6 +241,8 @@ def step(
 			Function for calculating state-action values.
 		params: PyTree
 			The parameters of the Q-function.
+		o: ArrayLike
+			Current observation of the environment state.
 		eps: float
 			Epsilon value for epsilon-greedy action selection.
 
@@ -242,7 +250,6 @@ def step(
 		Transitions
 			Tuple (o, a, r, o_next, d) of nd-arrays.
 	"""
-	o, *_ = env_fn(None)
 
 	# Select the actions using eps-greedy.
 	q_values = q_fn(params, o) # shape (B, acts) or (acts,)

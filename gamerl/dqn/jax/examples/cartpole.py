@@ -48,20 +48,6 @@ class DeepQNetwork:
 		_, params = self.init_fn(rng, (-1,) + in_shape)
 		return params
 
-# EnvironmentStepFn is a Callable that steps the environment.
-class EnvironmentStepFn:
-	def __init__(self, rng, env):
-		seed = jax.random.randint(rng, (), 0, jnp.iinfo(jnp.int32).max).item()
-		self.env = env
-		self.o, _ = env.reset(seed=seed)
-	def __call__(self, acts):
-		if acts is None:
-			return self.o, None, None, None, None
-		acts = np.asarray(acts)
-		res = self.env.step(acts)
-		self.o = res[0]
-		return res
-
 # OptimizerFn is a Callable that updates the parameters.
 class OptimizerFn:
 	def __init__(self, opt_update, get_params):
@@ -96,7 +82,9 @@ if __name__ == "__main__":
 	env = gym.wrappers.Autoreset(
 		gym.make("CartPole-v1", max_episode_steps=steps_limit),
 	)
-	env_fn = EnvironmentStepFn(rng_, env)
+	seed = jax.random.randint(rng_, (), 0, jnp.iinfo(jnp.int32).max).item()
+	init_obs, _ = env.reset(seed=seed)
+	env_fn = lambda acts: env.step(np.asarray(acts))
 
 	# Define the DQN function.
 	in_shape = env.observation_space.shape
@@ -118,7 +106,7 @@ if __name__ == "__main__":
 		discount=discount, batch_size=batch_size, eps=eps,
 	)
 	rng, rng_ = jax.random.split(rng)
-	params, _ = dqn_learner(rng_, params, opt_state, n_steps, prefill_steps)
+	params, _ = dqn_learner(rng_, params, opt_state, init_obs, n_steps, prefill_steps)
 
 	env.close()
 	log_dir = "CartPole-v1"
@@ -137,9 +125,8 @@ if __name__ == "__main__":
 	while env.recording:
 		o = jnp.asarray(np.expand_dims(o, axis=0))
 		q_values = q_fn(params, o)
-		acts = jnp.argmax(q_values, axis=-1)
-		acts = np.asarray(acts)[0]
-		o, r, t, tr, info = env.step(acts)
+		acts = jnp.argmax(q_values, axis=-1).squeeze()
+		o, r, t, tr, info = env.step(np.asarray(acts))
 	env.close()
 
 	# Generate plots.
